@@ -1,0 +1,211 @@
+震惊！一行代码接口响应变成微秒级
+火焰图入门与神秘的TCP
+15 Jul 2017
+
+孙讷敏
+系统工具，平台研发
+sunnemin@gmail.com
+@_Tsunami_42_
+
+* 目录
+
+-   问题描述
+-   火焰图调优入门
+-   必要的转折
+-   神秘的TCP
+
+* 问题描述
+
+* 问题描述
+
+一个简单的HTTP日志转发接口：读取Request Body，按行分割，转发到Kafka
+
+日志行数不同，接口响应时间有显著差异
+
+-   20行日志，不连续请求，响应时间稳定在40ms
+-   20行日志，不间断请求，平均响应时间毫秒级
+-   30行日志，平均响应时间毫秒级
+
+* 通过火焰图调优
+
+* 通过火焰图调优
+
+-   火焰图介绍
+-   火焰图生成
+-   接口调优(with Go pprof)
+-   效果展示
+
+* 火焰图示例
+
+.image 00-flame_and_TCP/influxdb_cpu_60.svg _ 1000
+
+.caption [[00-flame_and_TCP/influxdb_cpu_60.svg][InfluxDB 60s CPU火焰图]]
+
+* 火焰图介绍
+
+基本信息 
+
+-   火焰图，也就是 FlameGraph，作者是超级大牛 Brendan Gregg
+-   主要作用就是将性能工具生成的数据进行可视化处理，方便开发人员查看。
+-   [[https://openresty.org/posts/dynamic-tracing/][动态追踪技术漫谈]] by 章亦春@OpenResty
+
+
+安装
+
+    # 安装perf
+    $ yum install -y perf
+
+    # 安装FlameGraph
+    $ cd /opt
+    $ git clone https://github.com/brendangregg/FlameGraph.git --depth=1
+    $ export PATH=$PATH:/opt/FlameGraph
+
+* 火焰图生成
+
+需要程序的调用栈包含有 DWARF 调试信息。
+perf采集与火焰图生成需要在同一台主机上
+
+: https://groups.google.com/d/msg/openresty/-5Px1kJHJGo/NuYZfS9iBCYJ
+
+    # 采集CPU数据并生成火焰图
+    $ perf record -F 99 -p $PID -g -o cpu_60_perf.data -- sleep 20
+    $ perf script -i cpu_60_perf.data | stackcollapse-perf.pl | flamegraph.pl > cpu_60.svg
+
+* 火焰图与Go
+
+通过HTTP接口暴露pprof数据
+.code 00-flame_and_TCP/pprof.go /^func AttachProfiler/,/^}/
+
+go-torch，使用Go自带的pprof库画出Go调用栈的火焰图
+
+    $ go get github.com/uber/go-torch
+    $ go-torch -f 30.svg -t 30 -u http://127.0.0.1:8094/debug/pprof/profile
+
+* 接口调优
+
+* 原始接口的火焰图
+
+.image 00-flame_and_TCP/v1.pprof.60s.torch.svg _ 1000
+
+.caption [[00-flame_and_TCP/v1.pprof.60s.torch.svg][火焰图]]
+
+* 原始接口的代码
+
+.code 00-flame_and_TCP/v1.main.go /^func logHandler/,/^}/ HL1
+
+* 优化后的火焰图
+
+.image 00-flame_and_TCP/v2.pprof.60s.torch.svg _ 1000
+
+.caption [[00-flame_and_TCP/v2.pprof.60s.torch.svg][火焰图]]
+
+* 优化后的代码
+
+.code 00-flame_and_TCP/v2.main.go /^func logHandler/,/^}/ HL2
+
+* 然而
+
+* 然而
+
+-   接口还是一样的慢
+
+-   这个时候，我们需要换个思路
+
+* 问题解决了
+
+.image 00-flame_and_TCP/TCP_NODELAY.png _ 800
+
+* TCP
+
+-   Silly Window Syndrome (SWS)
+-   针对SWS的优化策略
+
+* TCP滑动窗口
+
+[[http://coolshell.cn/articles/11609.html][TCP 的那些事儿（下）-- COOLSHELL]]
+
+    TCP头里有一个字段叫Window，又叫Advertised-Window
+    这个字段是接收端告诉发送端自己还有多少缓冲区可以接收数据。
+    于是发送端就可以根据这个接收端的处理能力来发送数据，而不会导致接收端处理不过来。
+
+Silly Window Syndrome(SWS)
+
+-   某些上古时期的协议，按字符发送消息
+-   吞吐率上不去 & 计算压力
+-   Too simple，这样不好
+
+* 解决SWS
+
+-   接收方：启发式(heuristic) & Delayed ACK
+-   发送方：Nagle算法
+
+* 接收方 - 启发式(heuristic)
+
+[[http://coolshell.cn/articles/11609.html][TCP 的那些事儿（下）-- COOLSHELL]]
+
+    MSS = maximum segment size
+
+在receiver端，如果收到的数据导致window size小于某个值，可以直接ACK(0)回sender
+这样就把window给关闭了，也阻止了sender再发数据过来
+等到receiver端处理了一些数据后满足以下条件之一：
+
+-   windows size 大于等于MSS
+-   receiver buffer有一半为空
+
+就可以把window打开让send发送数据过来。
+
+* 接收方 - Delayed ACK
+
+启发式(heuristic)：每个消息都会发送ACK
+Delayed ACK：只有满足一定的条件才发送ACK
+
+优点：
+
+-   增加吞吐量，ACK可以和返回的数据包一起返回
+-   在程序读取后再ACK，增加了window的大小
+
+缺点：
+
+-   可能造成TCP的重传
+-   TCP会根据ACK的时间来估算RTT
+
+[[https://tools.ietf.org/html/rfc1122#page-96][RFC1122]] ：
+
+    A TCP SHOULD implement a delayed ACK, but an ACK should not be excessively delayed; 
+    in particular, the delay MUST be less than 0.5 seconds, 
+    and in a stream of full-sized segments there SHOULD be an ACK for at least every second segment.
+
+
+* 发送方 - Nagle算法
+
+    if there is new data to send
+        if the window size >= MSS and available data is >= MSS
+            send complete MSS segment now
+        else
+            if there is unconfirmed data still in the pipe
+            enqueue data in the buffer until an ACKnowledge is received
+            else
+            send data immediately
+            end if
+        end if
+    end if
+
+    MSS = maximum segment size
+
+* 解决方案
+
+.image 00-flame_and_TCP/TCP_NODELAY.png
+
+.caption [[https://curl.haxx.se/libcurl/c/CURLOPT_TCP_NODELAY.html][CURLOPT_TCP_NODELAY explained]]
+
+* 参考资料
+
+https://openresty.org/posts/dynamic-tracing/
+
+https://mp.weixin.qq.com/s/gR2XOrRXCgOzGJP2witgfw
+
+https://huoding.com/2016/08/18/531
+
+http://coolshell.cn/articles/11609.html
+
+https://curl.haxx.se/libcurl/c/CURLOPT_TCP_NODELAY.html
